@@ -1,0 +1,144 @@
+﻿@page "/"
+@inject AppState AppState
+@inject PeerJSService PeerService
+@inject NavigationManager Nav
+
+<PageTitle>PaperGames</PageTitle>
+
+<div class="home-page">
+    <div class="home-card">
+        <div class="logo-area">
+            <h1 class="logo">PaperGames</h1>
+            <p class="tagline">Infinite Gomoku — no install, no signup</p>
+        </div>
+
+        <div class="form-group">
+            <label>Nickname</label>
+            <input class="input-field"
+                   @bind="nickname"
+                   @bind:event="oninput"
+                   placeholder="Enter your nickname"
+                   maxlength="20" />
+        </div>
+
+        <button class="btn btn-primary btn-full"
+                @onclick="HostGame"
+                disabled="@(isLoading || !CanAct)">
+            @if (isLoading && mode == "host") { <span class="btn-spinner"></span> }
+            Host a Lobby
+        </button>
+
+        <div class="divider"><span>or join</span></div>
+
+        <div class="join-row">
+            <input class="input-field input-code"
+                   @bind="joinCode"
+                   @bind:event="oninput"
+                   placeholder="6-char code"
+                   maxlength="6"
+                   style="text-transform:uppercase" />
+            <button class="btn btn-secondary"
+                    @onclick="JoinGame"
+                    disabled="@(isLoading || !CanAct || joinCode.Length < 6)">
+                @if (isLoading && mode == "join") { <span class="btn-spinner"></span> }
+                Join
+            </button>
+        </div>
+
+        @if (error != null)
+        {
+            <div class="error-banner">@error</div>
+        }
+    </div>
+</div>
+
+@code {
+    [SupplyParameterFromQuery(Name = "join")]
+    private string? QueryJoinCode { get; set; }
+
+    private string nickname = "";
+    private string joinCode = "";
+    private bool isLoading = false;
+    private string? mode = null;
+    private string? error = null;
+
+    private bool CanAct => !string.IsNullOrWhiteSpace(nickname);
+
+    protected override void OnParametersSet()
+    {
+        if (!string.IsNullOrEmpty(QueryJoinCode))
+            joinCode = QueryJoinCode.ToUpperInvariant();
+    }
+
+    private async Task HostGame()
+    {
+        isLoading = true;
+        mode = "host";
+        error = null;
+
+        try
+        {
+            var lobbyCode = GenerateLobbyCode();
+            AppState.Reset();
+            AppState.MyNickname = nickname.Trim();
+            AppState.IsHost = true;
+            AppState.LobbyCode = lobbyCode;
+            AppState.Players = new List<Player> { new(lobbyCode, nickname.Trim()) };
+
+            PeerService.PeerError += OnError;
+            await PeerService.InitHostAsync(lobbyCode);
+            AppState.MyPeerId = lobbyCode;
+
+            Nav.NavigateTo("/lobby");
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+            isLoading = false;
+        }
+    }
+
+    private async Task JoinGame()
+    {
+        isLoading = true;
+        mode = "join";
+        error = null;
+
+        try
+        {
+            var code = joinCode.ToUpperInvariant();
+            AppState.Reset();
+            AppState.MyNickname = nickname.Trim();
+            AppState.IsHost = false;
+            AppState.LobbyCode = code;
+
+            PeerService.PeerError += OnError;
+            var myId = await PeerService.InitGuestAsync();
+            AppState.MyPeerId = myId;
+
+            await PeerService.ConnectToHostAsync(code);
+            await PeerService.SendAsync(code, new JoinMessage("join", nickname.Trim()));
+
+            Nav.NavigateTo("/lobby");
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+            isLoading = false;
+        }
+    }
+
+    private void OnError(string msg)
+    {
+        error = msg;
+        isLoading = false;
+        InvokeAsync(StateHasChanged);
+    }
+
+    private static string GenerateLobbyCode()
+    {
+        const string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        return new string(Enumerable.Range(0, 6)
+            .Select(_ => chars[Random.Shared.Next(chars.Length)]).ToArray());
+    }
+}

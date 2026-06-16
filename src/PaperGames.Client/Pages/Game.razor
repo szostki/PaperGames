@@ -1,0 +1,453 @@
+@page "/game"
+@inject AppState AppState
+@inject PeerJSService PeerService
+@inject NavigationManager Nav
+@inject IJSRuntime JS
+@implements IDisposable
+
+<PageTitle>PaperGames — Game</PageTitle>
+
+@if (gameState != null)
+{
+    <div class="game-container">
+        <div class="game-hud">
+            <div class="hud-side">
+                <span class="stone-indicator @(gameState.IAmBlack ? "stone-black" : "stone-white")"></span>
+                <span>@AppState.MyNickname</span>
+            </div>
+            <div class="hud-center">
+                @if (!gameState.IsOver)
+                {
+                    <span class="@(gameState.IsMyTurn ? "turn-active" : "turn-wait")">
+                        @(gameState.IsMyTurn ? "Your turn" : $"{gameState.OpponentNickname}'s turn")
+                    </span>
+                }
+            </div>
+            <div class="hud-side hud-right">
+                <span>@gameState.OpponentNickname</span>
+                <span class="stone-indicator @(!gameState.IAmBlack ? "stone-black" : "stone-white")"></span>
+            </div>
+        </div>
+
+        <svg @ref="_svgRef"
+             class="game-board"
+             width="100%" height="100%"
+             viewBox="@ViewBox"
+             @onpointerdown="OnPointerDown"
+             @onpointermove="OnPointerMove"
+             @onpointerup="OnPointerUp"
+             @onpointerleave="OnPointerLeave"
+             @onwheel="OnWheel"
+             @onwheel:preventDefault
+             @ontouchstart="OnTouchStart"
+             @ontouchmove="OnTouchMove"
+             @ontouchend="OnTouchEnd">
+
+            <defs>
+                <radialGradient id="gBlack" cx="35%" cy="35%">
+                    <stop offset="0%" stop-color="#888" />
+                    <stop offset="100%" stop-color="#111" />
+                </radialGradient>
+                <radialGradient id="gWhite" cx="35%" cy="35%">
+                    <stop offset="0%" stop-color="#fff" />
+                    <stop offset="100%" stop-color="#ccc" />
+                </radialGradient>
+                <pattern id="dotGrid" x="0" y="0" width="40" height="40" patternUnits="userSpaceOnUse">
+                    <circle cx="0" cy="0" r="1.8" fill="#2e3558" />
+                </pattern>
+            </defs>
+
+            <rect x="-9999" y="-9999" width="19998" height="19998" fill="#14172a" />
+            <rect x="-2400" y="-2400" width="4800" height="4800" fill="url(#dotGrid)" />
+
+            @foreach (var kvp in gameState.Stones)
+            {
+                var gx = kvp.Key.X;
+                var gy = kvp.Key.Y;
+                var isBlack = kvp.Value;
+                <circle @key="@($"s{gx},{gy}")"
+                        cx="@(gx * 40)" cy="@(gy * 40)"
+                        r="18"
+                        fill="@(isBlack ? "url(#gBlack)" : "url(#gWhite)")"
+                        stroke="@(isBlack ? "#000" : "#888")"
+                        stroke-width="0.8" />
+            }
+
+            @if (_hoverGx.HasValue && gameState.IsMyTurn && !gameState.IsOver)
+            {
+                <circle                         cx="@(_hoverGx.Value * 40)" cy="@(_hoverGy!.Value * 40)"
+                        r="18"
+                        fill="@(gameState.IAmBlack ? "rgba(150,150,150,0.4)" : "rgba(255,255,255,0.5)")"
+                        stroke="@(gameState.IAmBlack ? "#666" : "#aaa")"
+                        stroke-width="0.8"
+                        pointer-events="none" />
+            }
+        </svg>
+
+        @if (gameState.IsOver)
+        {
+            var iWon = gameState.WinnerId == AppState.MyPeerId;
+            <div class="game-overlay">
+                <div class="overlay-card">
+                    <h2>@(iWon ? "You won!" : "You lost!")</h2>
+                    <div class="overlay-actions">
+                        @if (!gameState.RematchRequested && !gameState.OpponentRequestedRematch)
+                        {
+                            <button class="btn btn-primary" @onclick="RequestRematch">Play again</button>
+                        }
+                        @if (gameState.RematchRequested)
+                        {
+                            <p class="overlay-hint">Waiting for @gameState.OpponentNickname...</p>
+                        }
+                        @if (gameState.OpponentRequestedRematch)
+                        {
+                            <p class="overlay-hint">@gameState.OpponentNickname wants a rematch!</p>
+                            <div class="btn-row">
+                                <button class="btn btn-primary" @onclick="AcceptRematch">Accept</button>
+                                <button class="btn btn-ghost" @onclick="DeclineRematch">Decline</button>
+                            </div>
+                        }
+                        <button class="btn btn-ghost" @onclick="BackToLobby">Back to Lobby</button>
+                    </div>
+                </div>
+            </div>
+        }
+    </div>
+}
+
+@code {
+    private GameState? gameState => AppState.CurrentGame;
+
+    private ElementReference _svgRef;
+    private double _svgLeft, _svgTop, _svgW = 800, _svgH = 600;
+
+    private const double CellSize = 40.0;
+    private const double BaseW = 800.0;
+    private const double BaseH = 600.0;
+
+    private double _panX = 0, _panY = 0;
+    private double _zoom = 1.0;
+
+    private double ViewBoxW => BaseW / _zoom;
+    private double ViewBoxH => BaseH / _zoom;
+    private string ViewBox => FormattableString.Invariant(
+        $"{-_panX - ViewBoxW / 2:F1} {-_panY - ViewBoxH / 2:F1} {ViewBoxW:F1} {ViewBoxH:F1}");
+
+    private bool _isDragging = false;
+    private double _dragLastX, _dragLastY, _dragStartX, _dragStartY;
+
+    private int? _hoverGx, _hoverGy;
+    private double _prevPinchDist = -1;
+
+    protected override void OnInitialized()
+    {
+        if (gameState == null)
+        {
+            Nav.NavigateTo("/");
+            return;
+        }
+        PeerService.MessageReceived += OnMessage;
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+        {
+            var rect = await JS.InvokeAsync<JsonElement>("PeerJSInterop.getElementRect", _svgRef);
+            _svgLeft = rect.GetProperty("left").GetDouble();
+            _svgTop = rect.GetProperty("top").GetDouble();
+            _svgW = rect.GetProperty("width").GetDouble();
+            _svgH = rect.GetProperty("height").GetDouble();
+        }
+    }
+
+    private (double wx, double wy) ScreenToWorld(double sx, double sy)
+    {
+        var vbX = -_panX - ViewBoxW / 2;
+        var vbY = -_panY - ViewBoxH / 2;
+        return ((sx - _svgLeft) * ViewBoxW / _svgW + vbX,
+                (sy - _svgTop) * ViewBoxH / _svgH + vbY);
+    }
+
+    private static (int gx, int gy) WorldToGrid(double wx, double wy)
+        => ((int)Math.Round(wx / CellSize), (int)Math.Round(wy / CellSize));
+
+    private static bool IsValidCell(int gx, int gy)
+        => gx >= -60 && gx <= 60 && gy >= -60 && gy <= 60;
+
+    private async Task OnPointerDown(PointerEventArgs e)
+    {
+        var rect = await JS.InvokeAsync<JsonElement>("PeerJSInterop.getElementRect", _svgRef);
+        _svgLeft = rect.GetProperty("left").GetDouble();
+        _svgTop = rect.GetProperty("top").GetDouble();
+        _svgW = Math.Max(rect.GetProperty("width").GetDouble(), 1);
+        _svgH = Math.Max(rect.GetProperty("height").GetDouble(), 1);
+
+        _isDragging = true;
+        _dragLastX = _dragStartX = e.ClientX;
+        _dragLastY = _dragStartY = e.ClientY;
+    }
+
+    private void OnPointerMove(PointerEventArgs e)
+    {
+        if (_isDragging)
+        {
+            _panX += (e.ClientX - _dragLastX) * ViewBoxW / _svgW;
+            _panY += (e.ClientY - _dragLastY) * ViewBoxH / _svgH;
+            _dragLastX = e.ClientX;
+            _dragLastY = e.ClientY;
+        }
+        else if (gameState?.IsMyTurn == true && !gameState.IsOver)
+        {
+            var (wx, wy) = ScreenToWorld(e.ClientX, e.ClientY);
+            var (gx, gy) = WorldToGrid(wx, wy);
+            if (IsValidCell(gx, gy) && !gameState.Stones.ContainsKey((gx, gy)))
+            {
+                _hoverGx = gx;
+                _hoverGy = gy;
+            }
+            else
+            {
+                _hoverGx = null;
+                _hoverGy = null;
+            }
+        }
+        StateHasChanged();
+    }
+
+    private async Task OnPointerUp(PointerEventArgs e)
+    {
+        var dx = e.ClientX - _dragStartX;
+        var dy = e.ClientY - _dragStartY;
+        _isDragging = false;
+
+        if (Math.Sqrt(dx * dx + dy * dy) < 5 && gameState?.IsMyTurn == true && !gameState.IsOver)
+        {
+            var (wx, wy) = ScreenToWorld(e.ClientX, e.ClientY);
+            var (gx, gy) = WorldToGrid(wx, wy);
+            await TryPlaceStone(gx, gy);
+        }
+    }
+
+    private void OnPointerLeave(PointerEventArgs e)
+    {
+        _isDragging = false;
+        _hoverGx = null;
+        _hoverGy = null;
+    }
+
+    private void OnWheel(WheelEventArgs e)
+    {
+        var (wx, wy) = ScreenToWorld(e.ClientX, e.ClientY);
+        _zoom = Math.Clamp(_zoom * (e.DeltaY > 0 ? 0.85 : 1.15), 0.15, 8.0);
+        var newVbW = BaseW / _zoom;
+        var newVbH = BaseH / _zoom;
+        _panX = (e.ClientX - _svgLeft) * newVbW / _svgW - wx - newVbW / 2;
+        _panY = (e.ClientY - _svgTop) * newVbH / _svgH - wy - newVbH / 2;
+        StateHasChanged();
+    }
+
+    private async Task OnTouchStart(TouchEventArgs e)
+    {
+        var rect = await JS.InvokeAsync<JsonElement>("PeerJSInterop.getElementRect", _svgRef);
+        _svgLeft = rect.GetProperty("left").GetDouble();
+        _svgTop = rect.GetProperty("top").GetDouble();
+        _svgW = Math.Max(rect.GetProperty("width").GetDouble(), 1);
+        _svgH = Math.Max(rect.GetProperty("height").GetDouble(), 1);
+
+        if (e.Touches.Length == 2)
+        {
+            _isDragging = false;
+            _prevPinchDist = PinchDist(e.Touches[0], e.Touches[1]);
+        }
+        else if (e.Touches.Length == 1)
+        {
+            _isDragging = true;
+            _dragLastX = _dragStartX = e.Touches[0].ClientX;
+            _dragLastY = _dragStartY = e.Touches[0].ClientY;
+        }
+    }
+
+    private void OnTouchMove(TouchEventArgs e)
+    {
+        if (e.Touches.Length == 2 && _prevPinchDist > 0)
+        {
+            var dist = PinchDist(e.Touches[0], e.Touches[1]);
+            var cx = (e.Touches[0].ClientX + e.Touches[1].ClientX) / 2;
+            var cy = (e.Touches[0].ClientY + e.Touches[1].ClientY) / 2;
+            var (wx, wy) = ScreenToWorld(cx, cy);
+            _zoom = Math.Clamp(_zoom * dist / _prevPinchDist, 0.15, 8.0);
+            var newVbW = BaseW / _zoom;
+            var newVbH = BaseH / _zoom;
+            _panX = (cx - _svgLeft) * newVbW / _svgW - wx - newVbW / 2;
+            _panY = (cy - _svgTop) * newVbH / _svgH - wy - newVbH / 2;
+            _prevPinchDist = dist;
+            StateHasChanged();
+        }
+        else if (e.Touches.Length == 1 && _isDragging)
+        {
+            _panX += (e.Touches[0].ClientX - _dragLastX) * ViewBoxW / _svgW;
+            _panY += (e.Touches[0].ClientY - _dragLastY) * ViewBoxH / _svgH;
+            _dragLastX = e.Touches[0].ClientX;
+            _dragLastY = e.Touches[0].ClientY;
+            StateHasChanged();
+        }
+    }
+
+    private async Task OnTouchEnd(TouchEventArgs e)
+    {
+        _prevPinchDist = -1;
+        if (e.ChangedTouches.Length == 1 && _isDragging)
+        {
+            var dx = e.ChangedTouches[0].ClientX - _dragStartX;
+            var dy = e.ChangedTouches[0].ClientY - _dragStartY;
+            _isDragging = false;
+            if (Math.Sqrt(dx * dx + dy * dy) < 10 && gameState?.IsMyTurn == true && !gameState.IsOver)
+            {
+                var (wx, wy) = ScreenToWorld(e.ChangedTouches[0].ClientX, e.ChangedTouches[0].ClientY);
+                var (gx, gy) = WorldToGrid(wx, wy);
+                await TryPlaceStone(gx, gy);
+            }
+        }
+        else
+        {
+            _isDragging = false;
+        }
+    }
+
+    private static double PinchDist(TouchPoint a, TouchPoint b)
+        => Math.Sqrt(Math.Pow(a.ClientX - b.ClientX, 2) + Math.Pow(a.ClientY - b.ClientY, 2));
+
+    private async Task TryPlaceStone(int gx, int gy)
+    {
+        if (!IsValidCell(gx, gy) || gameState!.Stones.ContainsKey((gx, gy))) return;
+
+        PlaceAndProcess(gx, gy, AppState.MyPeerId, gameState.IAmBlack);
+        await PeerService.SendAsync(gameState.OpponentId, new MoveMessage("move", gx, gy));
+
+        if (gameState.IsOver)
+            await PeerService.SendAsync(gameState.OpponentId,
+                new GameOverMessage("game_over", AppState.MyPeerId));
+    }
+
+    private void PlaceAndProcess(int gx, int gy, string playerId, bool isBlack)
+    {
+        gameState!.Stones[(gx, gy)] = isBlack;
+        _hoverGx = null;
+        _hoverGy = null;
+        gameState.IsMyTurn = playerId != AppState.MyPeerId;
+
+        if (HasWon(gx, gy, isBlack))
+        {
+            gameState.IsOver = true;
+            gameState.WinnerId = playerId;
+        }
+
+        StateHasChanged();
+    }
+
+    private bool HasWon(int x, int y, bool isBlack)
+    {
+        int[] dx = { 1, 0, 1, 1 };
+        int[] dy = { 0, 1, 1, -1 };
+
+        foreach (var (ddx, ddy) in dx.Zip(dy))
+        {
+            int count = 1;
+            for (int i = 1; i < 5; i++)
+                if (gameState!.Stones.TryGetValue((x + ddx * i, y + ddy * i), out var v) && v == isBlack) count++; else break;
+            for (int i = 1; i < 5; i++)
+                if (gameState!.Stones.TryGetValue((x - ddx * i, y - ddy * i), out var v) && v == isBlack) count++; else break;
+            if (count >= 5) return true;
+        }
+        return false;
+    }
+
+    private async void OnMessage(string fromPeerId, string json)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            var type = doc.RootElement.GetProperty("type").GetString();
+
+            switch (type)
+            {
+                case "move":
+                {
+                    var msg = JsonSerializer.Deserialize<MoveMessage>(json, JsonOptions.Default)!;
+                    if (!gameState!.Stones.ContainsKey((msg.X, msg.Y)))
+                        PlaceAndProcess(msg.X, msg.Y, fromPeerId, !gameState.IAmBlack);
+                    break;
+                }
+                case "game_over":
+                {
+                    var msg = JsonSerializer.Deserialize<GameOverMessage>(json, JsonOptions.Default)!;
+                    if (!gameState!.IsOver)
+                    {
+                        gameState.IsOver = true;
+                        gameState.WinnerId = msg.WinnerId;
+                    }
+                    break;
+                }
+                case "rematch_request":
+                    gameState!.OpponentRequestedRematch = true;
+                    break;
+
+                case "rematch_accepted":
+                    StartNewGame();
+                    return;
+
+                case "rematch_declined":
+                    gameState!.RematchRequested = false;
+                    break;
+            }
+
+            await InvokeAsync(StateHasChanged);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Game message error: {ex.Message}");
+        }
+    }
+
+    private async Task RequestRematch()
+    {
+        gameState!.RematchRequested = true;
+        await PeerService.SendAsync(gameState.OpponentId, new RematchRequestMessage("rematch_request"));
+    }
+
+    private async Task AcceptRematch()
+    {
+        await PeerService.SendAsync(gameState!.OpponentId, new RematchAcceptedMessage("rematch_accepted"));
+        StartNewGame();
+    }
+
+    private async Task DeclineRematch()
+    {
+        gameState!.OpponentRequestedRematch = false;
+        await PeerService.SendAsync(gameState.OpponentId, new RematchDeclinedMessage("rematch_declined"));
+    }
+
+    private void StartNewGame()
+    {
+        var iAmBlackNew = gameState!.WinnerId != AppState.MyPeerId;  // loser plays black
+
+        AppState.CurrentGame = new GameState
+        {
+            OpponentId = gameState.OpponentId,
+            OpponentNickname = gameState.OpponentNickname,
+            IAmBlack = iAmBlackNew,
+            IsMyTurn = iAmBlackNew
+        };
+        StateHasChanged();
+    }
+
+    private Task BackToLobby()
+    {
+        AppState.CurrentGame = null;
+        Nav.NavigateTo("/lobby");
+        return Task.CompletedTask;
+    }
+
+    public void Dispose() => PeerService.MessageReceived -= OnMessage;
+}

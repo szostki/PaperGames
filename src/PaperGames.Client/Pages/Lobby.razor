@@ -1,0 +1,210 @@
+@page "/lobby"
+@inject AppState AppState
+@inject PeerJSService PeerService
+@inject NavigationManager Nav
+@inject IJSRuntime JS
+@implements IDisposable
+
+<PageTitle>PaperGames — Lobby</PageTitle>
+
+<div class="lobby-page">
+    <div class="lobby-card">
+        <h2>Lobby</h2>
+
+        @if (AppState.IsHost)
+        {
+            <div class="lobby-invite-section">
+                <div class="lobby-code">@AppState.LobbyCode</div>
+                <p class="hint">Share the code or scan to join</p>
+                <canvas id="qr-canvas" class="qr-canvas"></canvas>
+                <div class="join-link"><a href="@JoinUrl" target="_blank">@JoinUrl</a></div>
+            </div>
+        }
+        else
+        {
+            <p class="hint">Connected to lobby <strong>@AppState.LobbyCode</strong></p>
+        }
+
+        <div class="section">
+            <h3>Players (@AppState.Players.Count)</h3>
+            <ul class="player-list">
+                @foreach (var player in AppState.Players)
+                {
+                    <li class="player-item" @key="player.Id">
+                        <span class="player-name">
+                            @player.Nickname
+                            @if (player.Id == AppState.MyPeerId)
+                            {
+                                <span class="badge">You</span>
+                            }
+                        </span>
+                        @if (AppState.IsHost && player.Id != AppState.MyPeerId && !invitePending)
+                        {
+                            <button class="btn btn-sm btn-primary"
+                                    @onclick="() => InvitePlayer(player)">
+                                Invite
+                            </button>
+                        }
+                    </li>
+                }
+            </ul>
+        </div>
+
+        @if (invitePending)
+        {
+            <div class="status-box">
+                Waiting for <strong>@invitedPlayer?.Nickname</strong> to accept...
+            </div>
+        }
+
+        @if (pendingInviteFrom != null)
+        {
+            <div class="invite-dialog">
+                <p><strong>@pendingInviteFrom.Nickname</strong> invited you to play!</p>
+                <div class="btn-row">
+                    <button class="btn btn-primary" @onclick="AcceptInvite">Accept</button>
+                    <button class="btn btn-ghost" @onclick="DeclineInvite">Decline</button>
+                </div>
+            </div>
+        }
+
+        <button class="btn btn-ghost btn-full" @onclick="Leave" style="margin-top:auto">
+            Leave Lobby
+        </button>
+    </div>
+</div>
+
+@code {
+    private bool invitePending = false;
+    private Player? invitedPlayer = null;
+    private Player? pendingInviteFrom = null;
+
+    private string JoinUrl =>
+        Nav.BaseUri.TrimEnd('/') + "/?join=" + AppState.LobbyCode;
+
+    protected override void OnInitialized()
+    {
+        if (string.IsNullOrEmpty(AppState.MyPeerId))
+        {
+            Nav.NavigateTo("/");
+            return;
+        }
+        PeerService.MessageReceived += OnMessage;
+        PeerService.PeerConnected += OnPeerConnected;
+        PeerService.PeerDisconnected += OnPeerDisconnected;
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender && AppState.IsHost)
+            await JS.InvokeVoidAsync("PeerJSInterop.generateQR", "qr-canvas", JoinUrl);
+    }
+
+    private async void OnMessage(string fromPeerId, string json)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            var type = doc.RootElement.GetProperty("type").GetString();
+
+            switch (type)
+            {
+                case "join" when AppState.IsHost:
+                {
+                    var msg = JsonSerializer.Deserialize<JoinMessage>(json, JsonOptions.Default)!;
+                    if (!AppState.Players.Any(p => p.Id == fromPeerId))
+                        AppState.Players.Add(new Player(fromPeerId, msg.Nickname));
+                    await BroadcastPlayerList();
+                    break;
+                }
+                case "player_list":
+                {
+                    var msg = JsonSerializer.Deserialize<PlayerListMessage>(json, JsonOptions.Default)!;
+                    AppState.Players = msg.Players;
+                    break;
+                }
+                case "invite":
+                {
+                    var msg = JsonSerializer.Deserialize<InviteMessage>(json, JsonOptions.Default)!;
+                    pendingInviteFrom = AppState.Players.FirstOrDefault(p => p.Id == msg.FromId)
+                                        ?? new Player(msg.FromId, "Host");
+                    break;
+                }
+                case "invite_accepted" when invitedPlayer != null:
+                {
+                    StartGame(invitedPlayer);
+                    return;
+                }
+            }
+
+            await InvokeAsync(StateHasChanged);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Lobby message error: {ex.Message}");
+        }
+    }
+
+    private async void OnPeerConnected(string peerId) =>
+        await InvokeAsync(StateHasChanged);
+
+    private async void OnPeerDisconnected(string peerId)
+    {
+        AppState.Players.RemoveAll(p => p.Id == peerId);
+        if (AppState.IsHost)
+            await BroadcastPlayerList();
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private Task BroadcastPlayerList() =>
+        PeerService.BroadcastAsync(new PlayerListMessage("player_list", AppState.Players));
+
+    private async Task InvitePlayer(Player player)
+    {
+        invitePending = true;
+        invitedPlayer = player;
+        await PeerService.SendAsync(player.Id,
+            new InviteMessage("invite", AppState.MyPeerId, player.Id));
+    }
+
+    private async Task AcceptInvite()
+    {
+        if (pendingInviteFrom == null) return;
+        var host = pendingInviteFrom;
+        pendingInviteFrom = null;
+        await PeerService.SendAsync(host.Id, new InviteAcceptedMessage("invite_accepted"));
+        StartGame(host);
+    }
+
+    private void DeclineInvite() => pendingInviteFrom = null;
+
+    private void StartGame(Player opponent)
+    {
+        // Invitee (non-host) always plays black (goes first) in the first game
+        bool iAmBlack = !AppState.IsHost;
+
+        AppState.CurrentGame = new GameState
+        {
+            OpponentId = opponent.Id,
+            OpponentNickname = opponent.Nickname,
+            IAmBlack = iAmBlack,
+            IsMyTurn = iAmBlack
+        };
+
+        Nav.NavigateTo("/game");
+    }
+
+    private async Task Leave()
+    {
+        AppState.Reset();
+        try { await PeerService.DestroyAsync(); } catch { }
+        Nav.NavigateTo("/");
+    }
+
+    public void Dispose()
+    {
+        PeerService.MessageReceived -= OnMessage;
+        PeerService.PeerConnected -= OnPeerConnected;
+        PeerService.PeerDisconnected -= OnPeerDisconnected;
+    }
+}
